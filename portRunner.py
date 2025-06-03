@@ -33,6 +33,7 @@ import csv
 import ipaddress
 import json
 import logging
+import logging.handlers
 import os
 import queue
 import random
@@ -193,6 +194,7 @@ class ScanResult:
 def raw_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
     sport = next_sport()
     seq = RandInt()
+    logging.info(f"Sending SYN to {dst_ip}:{dst_port} with sport {sport} and seq {seq}")
     syn = IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, flags="S", seq=seq)
 
     t0 = time.perf_counter()
@@ -200,26 +202,33 @@ def raw_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
     latency = (time.perf_counter() - t0) * 1000
 
     if not synack or not synack.haslayer(TCP):
+        logging.info(f"No SYN-ACK received from {dst_ip}:{dst_port}")
         return ScanResult("FILTERED", latency)
 
     flags = synack[TCP].flags
     if flags & 0x12 == 0x12:  # SYN-ACK
         # SYN-ACK received, send ACK
+        logging.info(f"Sending ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1}")
         send(
             IP(dst=dst_ip)
             / TCP(sport=sport, dport=dst_port, seq=seq + 1, ack=synack[TCP].seq + 1, flags="A"),
             verbose=False,
         )
         # final ACK + polite close
+        logging.info(f"Sending FIN to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1}")
         fin = IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, seq=seq + 1, ack=synack[TCP].seq + 1, flags="FA")
         finack = sr1(fin, timeout=1, verbose=False)
         if finack and finack[TCP].flags & 0x11 == 0x11:
+            logging.info(f"FIN-ACK received from {dst_ip}:{dst_port}")
+            logging.info(f"Sending ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 2}")
             send(IP(dst=dst_ip)/TCP(sport=sport, dport=dst_port,
                                     seq=seq+2, ack=finack[TCP].seq+1, flags="A"),
                                     verbose=False)
         return ScanResult("OPEN", latency)
     if flags & 0x14 == 0x14:
+        logging.info(f"RST received from {dst_ip}:{dst_port}")
         return ScanResult("CLOSED", latency)
+    logging.info(f"No response from {dst_ip}:{dst_port}")
     return ScanResult("FILTERED", latency)
 
 
@@ -230,9 +239,12 @@ def socket_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResul
         err = s.connect_ex((dst_ip, dst_port))
     latency = (time.perf_counter() - t0) * 1000
     if err == 0:
+        logging.info(f"OPEN connection to {dst_ip}:{dst_port}")
         return ScanResult("OPEN", latency)
     if err in (socket.errno.ECONNREFUSED, 111, 10061):  # posix + win
+        logging.info(f"CLOSED connection to {dst_ip}:{dst_port}")
         return ScanResult("CLOSED", latency)
+    logging.info(f"FILTERED connection to {dst_ip}:{dst_port}")
     return ScanResult("FILTERED", latency)
 
 ###############################################################################
@@ -343,9 +355,16 @@ def worker(
 
 def main():
     args = parse_args()
+    # Remove duplicate basicConfig calls and set up root logger
+    log_format = "[%(asctime)s][%(threadName)s] - %(message)s"
     logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(threadName)s] %(message)s",
-                        datefmt="%H:%M:%S")
+                        format=log_format,
+                        datefmt="%Y-%m-%d %H:%M:%S")
+    # File handler for rotating logs
+    file_handler = logging.handlers.RotatingFileHandler(
+        filename="portRunner.log", maxBytes=5 * 1024 * 1024, backupCount=3)
+    file_handler.setFormatter(logging.Formatter(log_format, "%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(file_handler)
 
     # Seed RNG for per-thread generators
     random.seed(os.getpid() ^ int(time.time()))
