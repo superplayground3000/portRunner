@@ -54,18 +54,18 @@ try:
     from scapy.all import (
         IP,
         TCP,
-        RandInt,
         L3RawSocket,
         send,
         sr1,
         conf,
     )
 except ImportError:
-    IP = TCP = RandInt = L3RawSocket = send = sr1 = conf = None  # type: ignore
+    IP = TCP = L3RawSocket = send = sr1 = conf = None  # type: ignore
 
 ###############################################################################
 # CLI + validation                                                            #
 ###############################################################################
+
 
 def port_token(token: str) -> Tuple[int, int]:
     """Return (lo, hi) inclusive for a port token."""
@@ -95,9 +95,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", help="csv output path")
     return p.parse_args()
 
+
 ###############################################################################
 # Host & port expansion                                                       #
 ###############################################################################
+
 
 def expand_hosts(spec: str) -> List[str]:
     hosts: List[str] = []
@@ -134,6 +136,7 @@ def expand_ports(spec: str) -> List[int]:
         ports.extend(range(lo, hi + 1))
     return ports
 
+
 ###############################################################################
 # Source-port allocator (raw engine only)                                     #
 ###############################################################################
@@ -161,9 +164,11 @@ def next_sport() -> int:
     lo, hi = _tls.slice
     return rng.randint(lo, hi)
 
+
 ###############################################################################
 # Rate limiter (monotonic)                                                    #
 ###############################################################################
+
 
 def token_bucket(pps: int, stop: threading.Event):
     sem = threading.Semaphore(0)
@@ -182,6 +187,7 @@ def token_bucket(pps: int, stop: threading.Event):
     threading.Thread(target=refill, name="bucket", daemon=True).start()
     return sem
 
+
 ###############################################################################
 # Scan engines                                                                #
 ###############################################################################
@@ -193,7 +199,7 @@ class ScanResult:
 
 def raw_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
     sport = next_sport()
-    seq = RandInt()
+    seq = random.randint(0, 1000)
     logging.info(f"Sending SYN to {dst_ip}:{dst_port} with sport {sport} and seq {seq}")
     syn = IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, flags="S", seq=seq)
 
@@ -208,22 +214,52 @@ def raw_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
     flags = synack[TCP].flags
     if flags & 0x12 == 0x12:  # SYN-ACK
         # SYN-ACK received, send ACK
-        logging.info(f"Sending ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1}")
+        logging.info(
+            f"Sending ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1} dstseq {synack[TCP].seq+1}"
+        )
         send(
             IP(dst=dst_ip)
-            / TCP(sport=sport, dport=dst_port, seq=seq + 1, ack=synack[TCP].seq + 1, flags="A"),
+            / TCP(
+                sport=sport,
+                dport=dst_port,
+                seq=seq + 1,
+                ack=synack[TCP].seq + 1,
+                flags="A",
+            ),
             verbose=False,
         )
         # final ACK + polite close
-        logging.info(f"Sending FIN to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1}")
-        fin = IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, seq=seq + 1, ack=synack[TCP].seq + 1, flags="FA")
+        logging.info(
+            f"Sending FIN+ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1} dstseq {synack[TCP].seq + 1}"
+        )
+        fin = IP(dst=dst_ip) / TCP(
+            sport=sport,
+            dport=dst_port,
+            seq=seq + 1,
+            ack=synack[TCP].seq + 1,
+            flags="FA",
+        )
         finack = sr1(fin, timeout=1, verbose=False)
         if finack and finack[TCP].flags & 0x11 == 0x11:
             logging.info(f"FIN-ACK received from {dst_ip}:{dst_port}")
-            logging.info(f"Sending ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 2}")
-            send(IP(dst=dst_ip)/TCP(sport=sport, dport=dst_port,
-                                    seq=seq+2, ack=finack[TCP].seq+1, flags="A"),
-                                    verbose=False)
+            logging.info(
+                f"Sending final ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1} dstseq {finack[TCP].seq + 1}"
+            )
+            send(
+                IP(dst=dst_ip)
+                / TCP(
+                    sport=sport,
+                    dport=dst_port,
+                    seq=finack[TCP].ack,
+                    ack=finack[TCP].seq + 1,
+                    flags="A",
+                ),
+                verbose=False,
+            )
+        else:
+            logging.info(f"No FIN-ACK received from {dst_ip}:{dst_port}, sending RST")
+            send(IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, flags="R"), verbose=False)
+            return ScanResult("FILTERED", latency)
         return ScanResult("OPEN", latency)
     if flags & 0x14 == 0x14:
         logging.info(f"RST received from {dst_ip}:{dst_port}")
@@ -247,11 +283,17 @@ def socket_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResul
     logging.info(f"FILTERED connection to {dst_ip}:{dst_port}")
     return ScanResult("FILTERED", latency)
 
+
 ###############################################################################
 # Writer thread                                                               #
 ###############################################################################
 
-def writer_thread(csv_path: Path, queue_: "queue.Queue[Tuple[str,str,int,str,float]]", stop: threading.Event):
+
+def writer_thread(
+    csv_path: Path,
+    queue_: "queue.Queue[Tuple[str,str,int,str,float]]",
+    stop: threading.Event,
+):
     with csv_path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["timestamp", "dst_ip", "dst_port", "status", "latency_ms"])
@@ -263,9 +305,11 @@ def writer_thread(csv_path: Path, queue_: "queue.Queue[Tuple[str,str,int,str,flo
             w.writerow(row)
             queue_.task_done()
 
+
 ###############################################################################
 # Checkpoint                                                                  #
 ###############################################################################
+
 
 def save_checkpoint(path: Path, todo: Iterable[Tuple[str, int]], written: int):
     data = {
@@ -279,9 +323,11 @@ def save_checkpoint(path: Path, todo: Iterable[Tuple[str, int]], written: int):
 def load_checkpoint(path: Path) -> List[Tuple[str, int]]:
     return json.loads(path.read_text())["remaining"]
 
+
 ###############################################################################
 # Privilege / capability check                                                #
 ###############################################################################
+
 
 def raw_capable() -> bool:
     if IP is None:
@@ -299,9 +345,11 @@ def raw_capable() -> bool:
     except Exception:
         return False
 
+
 ###############################################################################
 # Resource limit check                                                        #
 ###############################################################################
+
 
 def check_fds(workers: int):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -314,9 +362,11 @@ def check_fds(workers: int):
             need,
         )
 
+
 ###############################################################################
 # Worker                                                                      #
 ###############################################################################
+
 
 def worker(
     q_in: "queue.Queue[Tuple[str,int]]",
@@ -326,7 +376,7 @@ def worker(
     timeout: float,
     dryrun: bool,
     engine,
-    token
+    token,
 ):
     while not stop.is_set():
         try:
@@ -342,27 +392,31 @@ def worker(
                 res = engine(dst_ip, dst_port, timeout)
             except Exception as exc:
                 logging.exception("worker error %s:%d", dst_ip, dst_port)
+                logging.error(f"Error: {exc}")
                 res = ScanResult("ERROR", 0.0)
-        ts = datetime.utcnow().isoformat()
+        ts = datetime.now(timezone.utc).isoformat()
         q_out.put((ts, dst_ip, dst_port, res.status, round(res.latency_ms, 2)))
         q_in.task_done()
         if delay_s:
             time.sleep(delay_s)
 
+
 ###############################################################################
 # Main                                                                        #
 ###############################################################################
+
 
 def main():
     args = parse_args()
     # Remove duplicate basicConfig calls and set up root logger
     log_format = "[%(asctime)s][%(threadName)s] - %(message)s"
-    logging.basicConfig(level=logging.INFO,
-                        format=log_format,
-                        datefmt="%Y-%m-%d %H:%M:%S")
+    logging.basicConfig(
+        level=logging.INFO, format=log_format, datefmt="%Y-%m-%d %H:%M:%S"
+    )
     # File handler for rotating logs
     file_handler = logging.handlers.RotatingFileHandler(
-        filename="portRunner.log", maxBytes=5 * 1024 * 1024, backupCount=3)
+        filename="portRunner.log", maxBytes=5 * 1024 * 1024, backupCount=3
+    )
     file_handler.setFormatter(logging.Formatter(log_format, "%Y-%m-%d %H:%M:%S"))
     logging.getLogger().addHandler(file_handler)
 
@@ -401,7 +455,14 @@ def main():
 
     # Choose scan engine
     engine = socket_connect_scan
-    if not args.dryrun and raw_capable():
+    if not args.dryrun:
+        if not raw_capable():
+            print("\nError: Raw packet scanning is not available.")
+            print("To enable raw packet scanning:")
+            print("1. Install Npcap (Windows) or libpcap (Linux/macOS)")
+            print("2. Run the script with root/administrator privileges")
+            print("\nAlternatively, you can continue with socket-based scanning by using --dryrun flag")
+            sys.exit(1)
         logging.info("using raw packet engine")
         engine = raw_connect_scan
         init_port_slices(args.worker)
@@ -411,14 +472,19 @@ def main():
         logging.info("using socket connect engine")
 
     # Output CSV path
-    out_path = Path(args.output) if args.output else Path(
-        f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    out_path = (
+        Path(args.output)
+        if args.output
+        else Path(f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    )
 
     # Launch writer thread
-    threading.Thread(target=writer_thread,
-                     name="writer",
-                     args=(out_path, q_out, writer_stop),
-                     daemon=True).start()
+    threading.Thread(
+        target=writer_thread,
+        name="writer",
+        args=(out_path, q_out, writer_stop),
+        daemon=True,
+    ).start()
 
     # Interrupt handler
     def handle_interrupt(signum=None, frame=None):
@@ -440,11 +506,21 @@ def main():
     delay_s = args.delay / 1000.0
     workers: List[threading.Thread] = []
     for idx in range(args.worker):
-        t = threading.Thread(target=worker,
-                             name=f"runner-{idx+1}",
-                             args=(q_in, q_out, stop_event, delay_s, args.timeout,
-                                   args.dryrun, engine, token_sem),
-                             daemon=True)
+        t = threading.Thread(
+            target=worker,
+            name=f"runner-{idx+1}",
+            args=(
+                q_in,
+                q_out,
+                stop_event,
+                delay_s,
+                args.timeout,
+                args.dryrun,
+                engine,
+                token_sem,
+            ),
+            daemon=True,
+        )
         t.start()
         workers.append(t)
 
