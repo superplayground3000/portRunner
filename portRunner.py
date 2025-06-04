@@ -319,16 +319,17 @@ def writer_thread(csv_path: Path,
 ###############################################################################
 
 
-def save_checkpoint(path: Path, todo: Iterable[Tuple[str, int]], written: int):
+def save_checkpoint(path: Path, todo: Iterable[Tuple[str, int]]):
+    """Write remaining targets to a checkpoint JSON file."""
     data = {
         "remaining": list(todo),
-        "written_rows": written,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     path.write_text(json.dumps(data, indent=2))
 
 
 def load_checkpoint(path: Path) -> List[Tuple[str, int]]:
+    """Load remaining targets from a checkpoint JSON file."""
     return json.loads(path.read_text())["remaining"]
 
 
