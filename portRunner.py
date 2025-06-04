@@ -456,16 +456,16 @@ def main():
     # Choose scan engine
     engine = socket_connect_scan
     if not args.dryrun:
-        if not raw_capable():
+        if raw_capable():
+            logging.info("using raw packet engine")
+            engine = raw_connect_scan
+            init_port_slices(args.worker)
+        else:
             print("\nError: Raw packet scanning is not available.")
             print("To enable raw packet scanning:")
             print("1. Install Npcap (Windows) or libpcap (Linux/macOS)")
             print("2. Run the script with root/administrator privileges")
             print("\nAlternatively, you can continue with socket-based scanning by using --dryrun flag")
-            sys.exit(1)
-        logging.info("using raw packet engine")
-        engine = raw_connect_scan
-        init_port_slices(args.worker)
         if IP is not None:
             conf.L3socket = L3RawSocket
     else:
