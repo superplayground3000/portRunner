@@ -319,10 +319,10 @@ def writer_thread(csv_path: Path,
 ###############################################################################
 
 
-def save_checkpoint(path: Path, todo: Iterable[Tuple[str, int]], written: int):
+def save_checkpoint(path: Path, todo: Iterable[Tuple[str, int]]):
+    """Persist remaining targets to a JSON checkpoint file."""
     data = {
         "remaining": list(todo),
-        "written_rows": written,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     path.write_text(json.dumps(data, indent=2))
