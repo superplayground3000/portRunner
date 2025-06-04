@@ -37,7 +37,6 @@ import logging.handlers
 import os
 import queue
 import random
-import resource
 import signal
 import socket
 import sys
@@ -54,13 +53,13 @@ try:
     from scapy.all import (
         IP,
         TCP,
-        L3RawSocket,
         send,
         sr1,
         conf,
     )
-except ImportError:
-    IP = TCP = L3RawSocket = send = sr1 = conf = None  # type: ignore
+except ImportError as e:
+    print(e)
+    IP = TCP = send = sr1 = conf = None  # type: ignore
 
 ###############################################################################
 # CLI + validation                                                            #
@@ -302,8 +301,11 @@ def writer_thread(
                 row = queue_.get(timeout=0.2)
             except queue.Empty:
                 continue
+            logging.info(f"writing log {row}")
             w.writerow(row)
+            f.flush()
             queue_.task_done()
+
 
 
 ###############################################################################
@@ -331,10 +333,14 @@ def load_checkpoint(path: Path) -> List[Tuple[str, int]]:
 
 def raw_capable() -> bool:
     if IP is None:
+        logging.info("Failed to load scapy.IP ")
         return False
     if os.name == "nt":
         # scapy with npcap needs conf.use_pcap True
         return bool(getattr(conf, "use_pcap", False))
+    else:
+        from scapy.all import L3RawSocket
+        conf.L3socket = L3RawSocket
     if os.geteuid() == 0:
         return True
     # try cap_net_raw
@@ -343,6 +349,7 @@ def raw_capable() -> bool:
 
         return "cap_net_raw" in subprocess.check_output(["capsh", "--print"], text=True)
     except Exception:
+        logging.info("Failed to run capsh --print ")
         return False
 
 
@@ -352,15 +359,19 @@ def raw_capable() -> bool:
 
 
 def check_fds(workers: int):
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    need = workers * 4  # conservative worst-case
-    if need > soft:
-        logging.warning(
-            "FD limit (%d) lower than predicted need (%d). consider `ulimit -n %d`",
-            soft,
-            need,
-            need,
-        )
+    if os.name != "nt":
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        need = workers * 4  # conservative worst-case
+        if need > soft:
+            logging.warning(
+                "FD limit (%d) lower than predicted need (%d). consider `ulimit -n %d`",
+                soft,
+                need,
+                need,
+            )
+    else:
+        pass
 
 
 ###############################################################################
@@ -460,16 +471,15 @@ def main():
             logging.info("using raw packet engine")
             engine = raw_connect_scan
             init_port_slices(args.worker)
+
         else:
-            print("\nError: Raw packet scanning is not available.")
+            print("\nWarning: Raw packet scanning is not available.")
             print("To enable raw packet scanning:")
             print("1. Install Npcap (Windows) or libpcap (Linux/macOS)")
             print("2. Run the script with root/administrator privileges")
             print("\nAlternatively, you can continue with socket-based scanning by using --dryrun flag")
-        if IP is not None:
-            conf.L3socket = L3RawSocket
-    else:
-        logging.info("using socket connect engine")
+            logging.info("using socket connect engine")
+
 
     # Output CSV path
     out_path = (
