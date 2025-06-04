@@ -288,24 +288,30 @@ def socket_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResul
 ###############################################################################
 
 
-def writer_thread(
-    csv_path: Path,
-    queue_: "queue.Queue[Tuple[str,str,int,str,float]]",
-    stop: threading.Event,
-):
-    with csv_path.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["timestamp", "dst_ip", "dst_port", "status", "latency_ms"])
-        while not stop.is_set() or not queue_.empty():
+def writer_thread(csv_path: Path,
+                  queue_: "queue.Queue[Tuple[str, str, int, str, float]]",
+                  stop: threading.Event):
+
+    mode = "w" if not csv_path.exists() else "a"
+    with csv_path.open(mode,
+                       newline="",
+                       buffering=1,          # line-buffered
+                       encoding="utf-8") as f:
+        w = csv.writer(f, lineterminator="\n")
+        if mode == "w":                      # first run only
+            w.writerow(["timestamp", "dst_ip", "dst_port", "status", "latency_ms"])
+
+        while True:
             try:
                 row = queue_.get(timeout=0.2)
             except queue.Empty:
+                if stop.is_set() and queue_.empty():
+                    break
                 continue
-            logging.info(f"writing log {row}")
-            w.writerow(row)
-            f.flush()
-            queue_.task_done()
 
+            w.writerow(row)
+            f.flush()                        # ensure visibility
+            queue_.task_done()
 
 
 ###############################################################################
