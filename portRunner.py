@@ -7,10 +7,7 @@ make available:
 * **Raw connect engine** - Linux / macOS / Windows + Npcap when CAP_NET_RAW
   or Administrator is present.  Uses Scapy to craft SYN, observes SYN-ACK /
   RST, performs polite FIN, identical to a full three-way handshake.
-* **Socket connect engine** - Works everywhere (plain user mode).  Uses the
-  kernel's `connect_ex()` which internally does the same handshake and returns
-  well-defined POSIX error codes.  Returns the same semantic states (OPEN /
-  CLOSED / FILTERED).
+* **dry run engine** - Does not send any packets, just prints the scan to the console.
 
 Major features
 --------------
@@ -43,7 +40,6 @@ import sys
 import threading
 import time
 import subprocess
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,7 +92,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--worker", type=int, default=1, help="thread count (default 1)")
     p.add_argument("--timeout", type=float, default=2.0, help="probe timeout seconds")
     p.add_argument("--delay", type=int, default=0, help="per-probe delay ms")
-    p.add_argument("--pps", type=int, default=0, help="global packets-per-second")
     p.add_argument("--queue", type=int, default=0, help="bounded queue size (0=auto)")
     p.add_argument("--dryrun", action="store_true", help="no packets, just walk list")
     p.add_argument("--resume", help="checkpoint json path")
@@ -246,29 +241,6 @@ def next_sport() -> int:
 
 
 ###############################################################################
-# Rate limiter (monotonic)                                                    #
-###############################################################################
-
-
-def token_bucket(pps: int, stop: threading.Event):
-    sem = threading.Semaphore(0)
-    period = 1.0 / max(pps, 1)
-
-    def refill():
-        next_ts = time.monotonic()
-        while not stop.is_set():
-            now = time.monotonic()
-            if now >= next_ts:
-                sem.release()
-                next_ts += period
-            else:
-                time.sleep(next_ts - now)
-
-    threading.Thread(target=refill, name="bucket", daemon=True).start()
-    return sem
-
-
-###############################################################################
 # Scan engines                                                                #
 ###############################################################################
 @dataclass
@@ -348,20 +320,9 @@ def raw_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
     return ScanResult("FILTERED", latency)
 
 
-def socket_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
-    t0 = time.perf_counter()
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.settimeout(timeout)
-        err = s.connect_ex((dst_ip, dst_port))
-    latency = (time.perf_counter() - t0) * 1000
-    if err == 0:
-        logging.info(f"OPEN connection to {dst_ip}:{dst_port}")
-        return ScanResult("OPEN", latency)
-    if err in (socket.errno.ECONNREFUSED, 111, 10061):  # posix + win
-        logging.info(f"CLOSED connection to {dst_ip}:{dst_port}")
-        return ScanResult("CLOSED", latency)
-    logging.info(f"FILTERED connection to {dst_ip}:{dst_port}")
-    return ScanResult("FILTERED", latency)
+def dryrun_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
+    print(f"Dryrun scan to {dst_ip}:{dst_port}")
+    return ScanResult("DRYRUN", 0.0)
 
 
 ###############################################################################
@@ -475,15 +436,12 @@ def worker(
     timeout: float,
     dryrun: bool,
     engine,
-    token,
 ):
     while not stop.is_set():
         try:
             dst_ip, dst_port = q_in.get_nowait()
         except queue.Empty:
             return
-        if token is not None:
-            token.acquire()
         if dryrun:
             res = ScanResult("DRYRUN", 0.0)
         else:
@@ -548,28 +506,24 @@ def main():
     stop_event = threading.Event()
     writer_stop = threading.Event()
 
-    # Token bucket if requested
-    token_sem = None
-    if args.pps and not args.dryrun:
-        token_sem = token_bucket(args.pps, stop_event)
-        logging.info("global PPS capped at %d", args.pps)
 
     # Choose scan engine
-    engine = socket_connect_scan
+    engine = dryrun_scan
     if not args.dryrun:
         if raw_capable():
             logging.info("using raw packet engine")
-            engine = raw_connect_scan
             init_port_slices(args.worker)
-
+            engine = raw_connect_scan
         else:
             print("\nWarning: Raw packet scanning is not available.")
             print("To enable raw packet scanning:")
             print("1. Install Npcap (Windows) or libpcap (Linux/macOS)")
             print("2. Run the script with root/administrator privileges")
             print("\nAlternatively, you can continue with socket-based scanning by using --dryrun flag")
-            logging.info("using socket connect engine")
+            logging.error("raw packet engine is not available")
+            os.exit(1)
 
+    
 
     # Output CSV path
     out_path = (
@@ -617,7 +571,6 @@ def main():
                 args.timeout,
                 args.dryrun,
                 engine,
-                token_sem,
             ),
             daemon=True,
         )
