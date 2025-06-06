@@ -42,6 +42,7 @@ import socket
 import sys
 import threading
 import time
+import subprocess
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -134,6 +135,32 @@ def expand_ports(spec: str) -> List[int]:
         lo, hi = port_token(part)
         ports.extend(range(lo, hi + 1))
     return ports
+
+
+def ping_host(host: str, timeout: float = 1.0) -> bool:
+    """Return True if host responds to a single ping."""
+    if os.name == "nt":
+        cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), host]
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(int(timeout)), host]
+    try:
+        return subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode == 0
+    except Exception as exc:
+        logging.error("Ping failed for %s: %s", host, exc)
+        return False
+
+
+def filter_responsive_hosts(hosts: List[str], timeout: float = 1.0) -> List[str]:
+    """Return only hosts that respond to ping."""
+    responsive = []
+    for host in hosts:
+        if ping_host(host, timeout):
+            responsive.append(host)
+        else:
+            logging.info("Host %s did not respond to ping - skipped", host)
+    return responsive
 
 
 ###############################################################################
@@ -447,6 +474,8 @@ def main():
         logging.info("resuming with %d unfinished targets", len(targets))
     else:
         hosts = expand_hosts(args.ip)
+        if not args.dryrun:
+            hosts = filter_responsive_hosts(hosts, args.timeout)
         ports = expand_ports(args.port)
         targets = [(h, p) for h in hosts for p in ports]
         logging.info("generated %d (ip,port) tuples", len(targets))
