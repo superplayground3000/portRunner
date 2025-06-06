@@ -83,8 +83,16 @@ def port_token(token: str) -> Tuple[int, int]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="cross-platform TCP port scanner")
-    p.add_argument("--ip", required=True, help="comma-separated IPv4/cidr/host list")
-    p.add_argument("--port", required=True, help="comma-separated ports or ranges")
+    p.add_argument(
+        "--ip",
+        required=True,
+        help="comma-separated IPv4/cidr/host list or path to CSV file",
+    )
+    p.add_argument(
+        "--port",
+        required=True,
+        help="comma-separated ports/ranges or path to CSV file",
+    )
     p.add_argument("--worker", type=int, default=1, help="thread count (default 1)")
     p.add_argument("--timeout", type=float, default=2.0, help="probe timeout seconds")
     p.add_argument("--delay", type=int, default=0, help="per-probe delay ms")
@@ -101,36 +109,82 @@ def parse_args() -> argparse.Namespace:
 ###############################################################################
 
 
+def _add_host_token(hosts: List[str], token: str) -> None:
+    """Parse a single host token and append expanded hosts."""
+    try:
+        net = ipaddress.ip_network(token, strict=False)
+        hosts.extend(str(h) for h in net.hosts())
+        return
+    except ValueError:
+        pass  # maybe hostname or single ip
+    try:
+        ipaddress.ip_address(token)
+        hosts.append(token)
+        return
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(token, None, proto=socket.IPPROTO_TCP)
+        hosts.extend({info[4][0] for info in infos})
+    except socket.gaierror:
+        logging.warning("UNRESOLVED host %s - skipped", token)
+
+
+def _hosts_from_csv(path: Path) -> List[str]:
+    hosts: List[str] = []
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for cell in row.values():
+                cell = cell.strip()
+                if not cell:
+                    continue
+                if "." not in cell and "/" not in cell:
+                    continue
+                _add_host_token(hosts, cell)
+    return hosts
+
+
 def expand_hosts(spec: str) -> List[str]:
     hosts: List[str] = []
     for token in (t.strip() for t in spec.split(",")):
         if not token:
             continue
-        try:
-            net = ipaddress.ip_network(token, strict=False)
-            hosts.extend(str(h) for h in net.hosts())
+        path = Path(token)
+        if path.is_file():
+            hosts.extend(_hosts_from_csv(path))
             continue
-        except ValueError:
-            pass  # maybe hostname or single ip
-        try:
-            ipaddress.ip_address(token)
-            hosts.append(token)
-            continue
-        except ValueError:
-            pass
-        # hostname → resolve
-        try:
-            infos = socket.getaddrinfo(token, None, proto=socket.IPPROTO_TCP)
-            hosts.extend({info[4][0] for info in infos})
-        except socket.gaierror:
-            logging.warning("UNRESOLVED host %s - skipped", token)
+        _add_host_token(hosts, token)
     return hosts
+
+
+def _ports_from_csv(path: Path) -> List[int]:
+    ports: List[int] = []
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for cell in row.values():
+                token = cell.strip()
+                if not token:
+                    continue
+                if "/" in token:
+                    token = token.split("/", 1)[0]
+                try:
+                    lo, hi = port_token(token)
+                    ports.extend(range(lo, hi + 1))
+                except (argparse.ArgumentTypeError, ValueError):
+                    continue
+    return ports
 
 
 def expand_ports(spec: str) -> List[int]:
     ports: List[int] = []
     for part in (p.strip() for p in spec.split(",")):
         if not part:
+            continue
+        path = Path(part)
+        if path.is_file():
+            ports.extend(_ports_from_csv(path))
             continue
         lo, hi = port_token(part)
         ports.extend(range(lo, hi + 1))
