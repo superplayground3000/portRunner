@@ -477,7 +477,7 @@ def main():
         if not args.dryrun:
             hosts = filter_responsive_hosts(hosts, args.timeout)
         ports = expand_ports(args.port)
-        targets = [(h, p) for h in hosts for p in ports]
+        targets = [(h, p) for p in ports for h in hosts]
         logging.info("generated %d (ip,port) tuples", len(targets))
 
     # Resource guard (posix)
