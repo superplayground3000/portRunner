@@ -1,0 +1,7 @@
+version: '3'
+services:
+  dummy:
+    image: python:3.11-slim
+    command: python -m http.server 8000
+    ports:
+      - "8000:8000"
