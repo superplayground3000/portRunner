@@ -317,7 +317,7 @@ def raw_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
         else:
             logging.info(f"No FIN-ACK received from {dst_ip}:{dst_port}, sending RST")
             send(IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, flags="R"), verbose=False)
-            return ScanResult("FILTERED", latency)
+            return ScanResult("OPEN", latency)
         return ScanResult("OPEN", latency)
     if flags & 0x14 == 0x14:
         logging.info(f"RST received from {dst_ip}:{dst_port}")
