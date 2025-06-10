@@ -248,10 +248,9 @@ def next_sport() -> int:
 ###############################################################################
 # Scan engines                                                                #
 ###############################################################################
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True)
 class ScanResult:
-    """Hold the result of a port probe."""
-
+    __slots__ = ('status', 'latency_ms')
     status: str
     latency_ms: float
 

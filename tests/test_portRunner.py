@@ -105,15 +105,35 @@ def test_scanresult_frozen_and_slots():
 
 def test_ping_host_calls_subprocess(monkeypatch):
     """ping_host should invoke subprocess.run with expected command."""
-    calls = []
+    # Using a list to store the command passed to the mock
+    # This allows us to inspect it after the call.
+    called_command_holder = []
+    mock_return_code = 0 # Simulate success by default
 
-    def fake_run(cmd, stdout=None, stderr=None):
-        calls.append(cmd)
-        class R:
-            returncode = 0
-        return R()
+    # Define a more robust fake_run function that accepts arbitrary arguments
+    # and mimics the structure of the object returned by subprocess.run.
+    def fake_subprocess_run(cmd_args_list, *args, **kwargs):
+        called_command_holder.append(cmd_args_list)
+        # Simulate a process run result
+        result_mock = mock.Mock()
+        result_mock.returncode = mock_return_code
+        return result_mock
 
-    monkeypatch.setattr(pr.subprocess, "run", fake_run)
+    monkeypatch.setattr(pr.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(pr.os, "name", "posix") # Test Linux/macOS path
+
     assert pr.ping_host("1.2.3.4", timeout=0.5) is True
-    assert calls, "subprocess.run was not called"
+    assert len(called_command_holder) == 1, "subprocess.run should have been called once for posix"
+    actual_command_posix = called_command_holder[0]
+    assert actual_command_posix[0].lower().endswith("ping")
+    assert "1.2.3.4" in actual_command_posix
+    assert "-c" in actual_command_posix and "1" in actual_command_posix
+    assert "-W" in actual_command_posix and "0" in actual_command_posix # From str(int(0.5))
 
+    called_command_holder.clear()
+    monkeypatch.setattr(pr.os, "name", "nt") # Test Windows path
+    assert pr.ping_host("5.6.7.8", timeout=0.7) is True
+    assert len(called_command_holder) == 1, "subprocess.run should have been called once for nt"
+    actual_command_nt = called_command_holder[0]
+    assert "5.6.7.8" in actual_command_nt
+    assert "-w" in actual_command_nt and "700" in actual_command_nt # From str(int(0.7 * 1000))
