@@ -38,6 +38,7 @@ import signal
 import socket
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import subprocess
 from dataclasses import dataclass
@@ -233,7 +234,11 @@ def init_port_slices(workers: int):
 def next_sport() -> int:
     rng = getattr(_tls, "rng", None)
     if rng is None:
-        tid = int(threading.current_thread().name.split("-")[-1]) - 1
+        name = threading.current_thread().name
+        digits = "".join(ch for ch in name if ch.isdigit())
+        tid = int(digits) if digits else 0
+        if "-" in name:
+            tid -= 1
         _tls.slice = _port_slices[tid]
         _tls.rng = rng = random.Random()
     lo, hi = _tls.slice
@@ -243,8 +248,10 @@ def next_sport() -> int:
 ###############################################################################
 # Scan engines                                                                #
 ###############################################################################
-@dataclass
+@dataclass(slots=True, frozen=True)
 class ScanResult:
+    """Hold the result of a port probe."""
+
     status: str
     latency_ms: float
 
@@ -556,14 +563,12 @@ def main():
     if os.name != "nt":
         signal.signal(signal.SIGINT, handle_interrupt)
 
-    # Spawn workers
+    # Spawn workers using ThreadPoolExecutor
     delay_s = args.delay / 1000.0
-    workers: List[threading.Thread] = []
-    for idx in range(args.worker):
-        t = threading.Thread(
-            target=worker,
-            name=f"runner-{idx+1}",
-            args=(
+    with ThreadPoolExecutor(max_workers=args.worker, thread_name_prefix="runner") as ex:
+        for _ in range(args.worker):
+            ex.submit(
+                worker,
                 q_in,
                 q_out,
                 stop_event,
@@ -571,22 +576,16 @@ def main():
                 args.timeout,
                 args.dryrun,
                 engine,
-            ),
-            daemon=True,
-        )
-        t.start()
-        workers.append(t)
+            )
 
-    # Wait for all input processed
-    try:
-        q_in.join()
-    except KeyboardInterrupt:
-        handle_interrupt()
+        # Wait for all input processed
+        try:
+            q_in.join()
+        except KeyboardInterrupt:
+            handle_interrupt()
 
-    # Signal shutdown and wait for workers to finish
-    stop_event.set()
-    for t in workers:
-        t.join()
+        # Signal shutdown and wait for workers to finish
+        stop_event.set()
 
     # Wait until all CSV rows consumed then stop writer
     q_out.join()
