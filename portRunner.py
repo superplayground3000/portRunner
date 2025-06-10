@@ -39,6 +39,7 @@ import socket
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from abc import ABC, abstractmethod
 import time
 import subprocess
 from dataclasses import dataclass
@@ -216,33 +217,6 @@ def filter_responsive_hosts(hosts: List[str], timeout: float = 1.0) -> List[str]
 ###############################################################################
 # Source-port allocator (raw engine only)                                     #
 ###############################################################################
-_port_slices: List[Tuple[int, int]] = []
-_tls = threading.local()
-
-
-def init_port_slices(workers: int):
-    base, hi = 10000, 65535
-    block = (hi - base + 1) // workers
-    if block == 0:
-        sys.exit("too many workers for source-port pool")
-    for i in range(workers):
-        start = base + i * block
-        end = base + (i + 1) * block - 1 if i < workers - 1 else hi
-        _port_slices.append((start, end))
-
-
-def next_sport() -> int:
-    rng = getattr(_tls, "rng", None)
-    if rng is None:
-        name = threading.current_thread().name
-        digits = "".join(ch for ch in name if ch.isdigit())
-        tid = int(digits) if digits else 0
-        if "-" in name:
-            tid -= 1
-        _tls.slice = _port_slices[tid]
-        _tls.rng = rng = random.Random()
-    lo, hi = _tls.slice
-    return rng.randint(lo, hi)
 
 
 ###############################################################################
@@ -255,80 +229,125 @@ class ScanResult:
     latency_ms: float
 
 
-def raw_connect_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
-    sport = next_sport()
-    seq = random.randint(0, 1000)
-    logging.info(f"Sending SYN to {dst_ip}:{dst_port} with sport {sport} and seq {seq}")
-    syn = IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, flags="S", seq=seq)
+class ScanEngine(ABC):
+    @abstractmethod
+    def scan(self, dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
+        """Performs a scan on the target IP and port."""
+        pass
 
-    t0 = time.perf_counter()
-    synack = sr1(syn, timeout=timeout, verbose=False)
-    latency = (time.perf_counter() - t0) * 1000
 
-    if not synack or not synack.haslayer(TCP):
-        logging.info(f"No SYN-ACK received from {dst_ip}:{dst_port}")
+class SourcePortAllocator:
+    def __init__(self, workers: int):
+        self._port_slices: List[Tuple[int, int]] = []
+        self._tls = threading.local()
+        base, hi = 10000, 65535  # High ports for source
+        if workers <= 0:
+            raise ValueError("Number of workers must be positive.")
+        block = (hi - base + 1) // workers
+        if block == 0:
+            # This means workers > (hi - base + 1)
+            logging.error("Too many workers for the available source-port pool size.")
+            sys.exit("Error: Too many workers for source-port pool. Reduce worker count.")
+        for i in range(workers):
+            start = base + i * block
+            end = base + (i + 1) * block - 1 if i < workers - 1 else hi
+            self._port_slices.append((start, end))
+        logging.info(f"Source port slices initialized for {workers} workers: {self._port_slices}")
+
+    def get_sport(self) -> int:
+        rng = getattr(self._tls, "rng", None)
+        if rng is None:
+            # Determine thread index from its name (e.g., "runner_0", "runner-1")
+            name = threading.current_thread().name
+            try:
+                # Handles "runner_X" or "ThreadPoolExecutor-X_Y"
+                # For ThreadPoolExecutor, it might be "ThreadPoolExecutor-N_M"
+                # We need a consistent way to map thread to slice.
+                # Assuming thread_name_prefix="runner" from ThreadPoolExecutor
+                if "runner" in name: # Specific to our ThreadPoolExecutor prefix
+                    tid_str = name.split("_")[-1]
+                    tid = int(tid_str)
+                else: # Fallback for other naming or direct thread creation
+                    digits = "".join(ch for ch in name if ch.isdigit())
+                    tid = int(digits) if digits else 0 # Simple fallback
+                    if "-" in name and tid > 0: # Heuristic for some pool naming
+                        tid -=1
+                
+                # Ensure tid is within bounds of available slices
+                slice_index = tid % len(self._port_slices)
+                self._tls.slice = self._port_slices[slice_index]
+                logging.debug(f"Thread {name} (tid {tid}, slice_index {slice_index}) assigned slice {self._tls.slice}")
+
+            except (ValueError, IndexError) as e:
+                logging.error(f"Could not determine slice for thread {name}: {e}. Defaulting to first slice.")
+                self._tls.slice = self._port_slices[0] # Fallback
+            
+            self._tls.rng = rng = random.Random() # Seeded by global random.seed()
+        
+        lo, hi = self._tls.slice
+        return rng.randint(lo, hi)
+
+
+class RawConnectScanEngine(ScanEngine):
+    def __init__(self, port_allocator: SourcePortAllocator):
+        if IP is None or TCP is None or sr1 is None or send is None or conf is None:
+            raise RuntimeError("Scapy components not loaded. Raw scanning unavailable.")
+        self.port_allocator = port_allocator
+        self._configure_scapy()
+
+    def _configure_scapy(self):
+        if os.name != "nt":
+            from scapy.all import L3RawSocket # Keep import local
+            conf.L3socket = L3RawSocket
+            logging.info("Scapy L3socket configured for non-NT OS.")
+        # On Windows, conf.use_pcap = True is usually needed and set by Scapy if Npcap is found.
+        # We rely on is_raw_scan_available() to have warned if conf.use_pcap is False.
+
+    def scan(self, dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
+        sport = self.port_allocator.get_sport()
+        seq = random.randint(0, 1000) # Random initial sequence number
+        logging.debug(f"RAW: {dst_ip}:{dst_port} from sport {sport}, seq {seq}, timeout {timeout}")
+        syn = IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, flags="S", seq=seq)
+
+        t0 = time.perf_counter()
+        synack = sr1(syn, timeout=timeout, verbose=False)
+        latency = (time.perf_counter() - t0) * 1000
+
+        if not synack or not synack.haslayer(TCP):
+            logging.debug(f"RAW: {dst_ip}:{dst_port} -> FILTERED (no SYN-ACK or not TCP)")
+            return ScanResult("FILTERED", latency)
+
+        flags = synack[TCP].flags
+        if flags.S and flags.A:  # SYN-ACK (0x12)
+            logging.debug(f"RAW: {dst_ip}:{dst_port} -> OPEN (SYN-ACK received)")
+            # Polite close: Send ACK for SYN-ACK, then FIN, expect FIN-ACK, send final ACK
+            ack_to_synack = IP(dst=dst_ip)/TCP(sport=sport, dport=dst_port, flags="A", seq=synack[TCP].ack, ack=synack[TCP].seq + 1)
+            send(ack_to_synack, verbose=False)
+
+            fin = IP(dst=dst_ip)/TCP(sport=sport, dport=dst_port, flags="FA", seq=synack[TCP].ack, ack=synack[TCP].seq + 1)
+            finack_rst = sr1(fin, timeout=max(0.1, timeout/4), verbose=False) # Shorter timeout for close
+
+            if finack_rst and finack_rst.haslayer(TCP) and finack_rst[TCP].flags.F and finack_rst[TCP].flags.A:
+                logging.debug(f"RAW: {dst_ip}:{dst_port} -> Graceful FIN-ACK received. Sending final ACK.")
+                final_ack = IP(dst=dst_ip)/TCP(sport=sport, dport=dst_port, flags="A", seq=finack_rst[TCP].ack, ack=finack_rst[TCP].seq + 1)
+                send(final_ack, verbose=False)
+            else: # No FIN-ACK, or RST received instead. Port is open but close was not graceful from their side.
+                logging.debug(f"RAW: {dst_ip}:{dst_port} -> No graceful FIN-ACK (or RST). Sending RST.")
+                send(IP(dst=dst_ip)/TCP(sport=sport, dport=dst_port, flags="R", seq=synack[TCP].ack), verbose=False)
+            return ScanResult("OPEN", latency)
+        elif flags.R:  # RST or RST-ACK (0x04 or 0x14)
+            logging.debug(f"RAW: {dst_ip}:{dst_port} -> CLOSED (RST received)")
+            return ScanResult("CLOSED", latency)
+        
+        logging.debug(f"RAW: {dst_ip}:{dst_port} -> UNKNOWN TCP flags {flags!s}. Reporting FILTERED.")
         return ScanResult("FILTERED", latency)
 
-    flags = synack[TCP].flags
-    if flags & 0x12 == 0x12:  # SYN-ACK
-        # SYN-ACK received, send ACK
-        logging.info(
-            f"Sending ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1} dstseq {synack[TCP].seq+1}"
-        )
-        send(
-            IP(dst=dst_ip)
-            / TCP(
-                sport=sport,
-                dport=dst_port,
-                seq=seq + 1,
-                ack=synack[TCP].seq + 1,
-                flags="A",
-            ),
-            verbose=False,
-        )
-        # final ACK + polite close
-        logging.info(
-            f"Sending FIN+ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1} dstseq {synack[TCP].seq + 1}"
-        )
-        fin = IP(dst=dst_ip) / TCP(
-            sport=sport,
-            dport=dst_port,
-            seq=seq + 1,
-            ack=synack[TCP].seq + 1,
-            flags="FA",
-        )
-        finack = sr1(fin, timeout=1, verbose=False)
-        if finack and finack[TCP].flags & 0x11 == 0x11:
-            logging.info(f"FIN-ACK received from {dst_ip}:{dst_port}")
-            logging.info(
-                f"Sending final ACK to {dst_ip}:{dst_port} with sport {sport} and seq {seq + 1} dstseq {finack[TCP].seq + 1}"
-            )
-            send(
-                IP(dst=dst_ip)
-                / TCP(
-                    sport=sport,
-                    dport=dst_port,
-                    seq=finack[TCP].ack,
-                    ack=finack[TCP].seq + 1,
-                    flags="A",
-                ),
-                verbose=False,
-            )
-        else:
-            logging.info(f"No FIN-ACK received from {dst_ip}:{dst_port}, sending RST")
-            send(IP(dst=dst_ip) / TCP(sport=sport, dport=dst_port, flags="R"), verbose=False)
-            return ScanResult("OPEN", latency)
-        return ScanResult("OPEN", latency)
-    if flags & 0x14 == 0x14:
-        logging.info(f"RST received from {dst_ip}:{dst_port}")
-        return ScanResult("CLOSED", latency)
-    logging.info(f"No response from {dst_ip}:{dst_port}")
-    return ScanResult("FILTERED", latency)
 
-
-def dryrun_scan(dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
-    print(f"Dryrun scan to {dst_ip}:{dst_port}")
-    return ScanResult("DRYRUN", 0.0)
+class DryRunScanEngine(ScanEngine):
+    def scan(self, dst_ip: str, dst_port: int, timeout: float) -> ScanResult:
+        # timeout is ignored for dry run
+        logging.info(f"DRYRUN: {dst_ip}:{dst_port}")
+        return ScanResult("DRYRUN", 0.0)
 
 
 ###############################################################################
@@ -386,26 +405,35 @@ def load_checkpoint(path: Path) -> List[Tuple[str, int]]:
 ###############################################################################
 
 
-def raw_capable() -> bool:
+def is_raw_scan_available() -> bool:
+    """Checks if conditions for raw packet scanning are met."""
     if IP is None:
-        logging.info("Failed to load scapy.IP ")
+        logging.warning("Scapy (IP component) not loaded. Raw scanning unavailable.")
         return False
-    if os.name == "nt":
-        # scapy with npcap needs conf.use_pcap True
-        return bool(getattr(conf, "use_pcap", False))
-    else:
-        from scapy.all import L3RawSocket
-        conf.L3socket = L3RawSocket
-    if os.geteuid() == 0:
-        return True
-    # try cap_net_raw
-    try:
-        import subprocess
 
-        return "cap_net_raw" in subprocess.check_output(["capsh", "--print"], text=True)
-    except Exception:
-        logging.info("Failed to run capsh --print ")
-        return False
+    if os.name == "nt":
+        if not getattr(conf, "use_pcap", False):
+            logging.warning(
+                "Scapy 'conf.use_pcap' is False on Windows. "
+                "Raw scanning requires Npcap and Scapy configured to use it. "
+                "Ensure Npcap is installed and accessible by Scapy."
+            )
+            # Depending on strictness, could return False. Scapy might still try.
+            # For now, let's assume privileges are the main gate if Scapy is loaded.
+        # Actual privilege check on Windows for raw sockets is implicit:
+        # Scapy will fail to open raw socket if not run as Administrator.
+    else:
+        # Check for root or CAP_NET_RAW on Linux/macOS
+        if os.geteuid() != 0:
+            try:
+                # This check is primarily for Linux
+                if "cap_net_raw" not in subprocess.check_output(["capsh", "--print"], text=True, stderr=subprocess.DEVNULL):
+                    logging.warning("Not root and CAP_NET_RAW not found (via capsh). Raw scanning likely unavailable.")
+                    return False
+            except (FileNotFoundError, subprocess.CalledProcessError, Exception) as e:
+                logging.warning(f"Could not verify CAP_NET_RAW via capsh (may not be installed or applicable): {e}. Assuming unavailable if not root.")
+                return False
+    return True # If we pass all checks for the OS.
 
 
 ###############################################################################
@@ -439,24 +467,19 @@ def worker(
     q_out: "queue.Queue[Tuple[str,str,int,str,float]]",
     stop: threading.Event,
     delay_s: float,
-    timeout: float,
-    dryrun: bool,
-    engine,
+    engine: ScanEngine, # Injected ScanEngine instance
+    scan_timeout: float,
 ):
     while not stop.is_set():
         try:
             dst_ip, dst_port = q_in.get_nowait()
         except queue.Empty:
             return
-        if dryrun:
-            res = ScanResult("DRYRUN", 0.0)
-        else:
-            try:
-                res = engine(dst_ip, dst_port, timeout)
-            except Exception as exc:
-                logging.exception("worker error %s:%d", dst_ip, dst_port)
-                logging.error(f"Error: {exc}")
-                res = ScanResult("ERROR", 0.0)
+        try:
+            res = engine.scan(dst_ip, dst_port, scan_timeout)
+        except Exception: # Catch all exceptions from the engine
+            logging.exception("Worker error scanning %s:%d", dst_ip, dst_port)
+            res = ScanResult("ERROR", 0.0) # Generic error status
         ts = datetime.now(timezone.utc).isoformat()
         q_out.put((ts, dst_ip, dst_port, res.status, round(res.latency_ms, 2)))
         q_in.task_done()
@@ -474,7 +497,8 @@ def main():
     # Remove duplicate basicConfig calls and set up root logger
     log_format = "[%(asctime)s][%(threadName)s] - %(message)s"
     logging.basicConfig(
-        level=logging.INFO, format=log_format, datefmt="%Y-%m-%d %H:%M:%S"
+        level=logging.INFO, format=log_format, datefmt="%Y-%m-%d %H:%M:%S",
+        force=True # Override any existing root logger configuration
     )
     # File handler for rotating logs
     file_handler = logging.handlers.RotatingFileHandler(
@@ -513,23 +537,29 @@ def main():
     writer_stop = threading.Event()
 
 
-    # Choose scan engine
-    engine = dryrun_scan
-    if not args.dryrun:
-        if raw_capable():
+    # Instantiate scan engine
+    scan_engine: ScanEngine
+    if args.dryrun:
+        logging.info("using dry run engine")
+        scan_engine = DryRunScanEngine()
+    else:
+        if is_raw_scan_available():
             logging.info("using raw packet engine")
-            init_port_slices(args.worker)
-            engine = raw_connect_scan
+            try:
+                source_port_allocator = SourcePortAllocator(args.worker)
+                scan_engine = RawConnectScanEngine(source_port_allocator)
+            except (RuntimeError, ValueError) as e: # Catch errors from engine/allocator init
+                logging.error(f"Failed to initialize raw scan engine: {e}")
+                sys.exit(1)
         else:
             print("\nWarning: Raw packet scanning is not available.")
             print("To enable raw packet scanning:")
-            print("1. Install Npcap (Windows) or libpcap (Linux/macOS)")
-            print("2. Run the script with root/administrator privileges")
-            print("\nAlternatively, you can continue with socket-based scanning by using --dryrun flag")
-            logging.error("raw packet engine is not available")
-            os.exit(1)
-
-    
+            print("  1. Ensure Scapy is correctly installed.")
+            print("  2. On Windows: Install Npcap and ensure Scapy can use it (often automatic). Run as Administrator.")
+            print("  3. On Linux/macOS: Run as root or with CAP_NET_RAW capability.")
+            print("\nAlternatively, use the --dryrun flag to simulate a scan.")
+            logging.error("Raw packet engine prerequisites not met. Exiting.")
+            sys.exit(1)
 
     # Output CSV path
     out_path = (
@@ -572,9 +602,8 @@ def main():
                 q_out,
                 stop_event,
                 delay_s,
-                args.timeout,
-                args.dryrun,
-                engine,
+                scan_engine,
+                args.timeout, # Pass scan_timeout to worker
             )
 
         # Wait for all input processed
