@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import dataclasses
 import queue
 import threading
 from unittest import mock
@@ -59,11 +60,13 @@ def test_init_port_slices_and_next_sport():
     def worker():
         results.append(pr.next_sport())
 
-    t1 = threading.Thread(target=worker, name="runner-1")
-    t2 = threading.Thread(target=worker, name="runner-2")
+    # Simulate ThreadPoolExecutor naming convention
+    t1 = threading.Thread(target=worker, name="runner_0")
+    t2 = threading.Thread(target=worker, name="runner_1")
     t1.start(); t2.start(); t1.join(); t2.join()
 
     slice1, slice2 = pr._port_slices
+    results.sort()
     assert slice1[0] <= results[0] <= slice1[1]
     assert slice2[0] <= results[1] <= slice2[1]
 
@@ -90,4 +93,27 @@ def test_checkpoint(tmp_path):
     pr.save_checkpoint(path, [("a", 1), ("b", 2)])
     loaded = pr.load_checkpoint(path)
     assert loaded == [["a", 1], ["b", 2]]
+
+
+def test_scanresult_frozen_and_slots():
+    """ScanResult should be immutable and use slots."""
+    res = pr.ScanResult("OPEN", 1.0)
+    assert hasattr(pr.ScanResult, "__slots__")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        res.status = "CLOSED"
+
+
+def test_ping_host_calls_subprocess(monkeypatch):
+    """ping_host should invoke subprocess.run with expected command."""
+    calls = []
+
+    def fake_run(cmd, stdout=None, stderr=None):
+        calls.append(cmd)
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(pr.subprocess, "run", fake_run)
+    assert pr.ping_host("1.2.3.4", timeout=0.5) is True
+    assert calls, "subprocess.run was not called"
 
